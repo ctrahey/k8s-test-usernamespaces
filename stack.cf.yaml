@@ -1,0 +1,195 @@
+Parameters:
+    KeyPair:
+        Type: AWS::EC2::KeyPair::KeyName
+        Description: Name of KeyPair (ensure correct region) to configure SSH access on nodes
+Resources:
+    CPVPC:
+        Type: AWS::EC2::VPC
+        Properties: 
+          CidrBlock: 10.0.0.0/16
+          EnableDnsHostnames: True
+    IGW:
+        Type: AWS::EC2::InternetGateway
+        Properties: {}
+    IGWtoVPC:
+        Type: AWS::EC2::VPCGatewayAttachment
+        Properties:
+          VpcId: !Ref CPVPC
+          InternetGatewayId: !Ref IGW
+    RT:
+        Type: AWS::EC2::RouteTable
+        Properties: 
+          VpcId: !Ref CPVPC
+    RouteIGW:
+        Type: AWS::EC2::Route
+        Properties: 
+          DestinationCidrBlock: 0.0.0.0/0
+          GatewayId: !Ref IGW
+          RouteTableId: !Ref RT
+    TestSNa:
+        Type: AWS::EC2::Subnet
+        Properties: 
+          CidrBlock: 10.0.1.0/24
+          MapPublicIpOnLaunch: true
+          AvailabilityZone: us-west-2a
+          VpcId: !Ref CPVPC
+    TestSNb:
+        Type: AWS::EC2::Subnet
+        Properties: 
+          CidrBlock: 10.0.2.0/24
+          MapPublicIpOnLaunch: true
+          AvailabilityZone: us-west-2b
+          VpcId: !Ref CPVPC
+    RTAssnSNa:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties: 
+          RouteTableId: !Ref RT
+          SubnetId: !Ref TestSNa
+    RTAssnNSb:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties: 
+          RouteTableId: !Ref RT
+          SubnetId: !Ref TestSNb
+    SGForCP:
+        Type: AWS::EC2::SecurityGroup
+        Properties: 
+          GroupDescription: "Allow SSH"
+          GroupName: ssh-for-cp
+          SecurityGroupIngress:
+            - CidrIp: 0.0.0.0/0
+              Description: SSH from anywhere
+              FromPort: 22
+              IpProtocol: tcp
+              ToPort: 22
+          VpcId: !Ref CPVPC
+    RoleForEKSCP:
+        Type: AWS::IAM::Role
+        Properties: 
+          AssumeRolePolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Principal:
+                    Service:
+                      - eks.amazonaws.com
+                  Action:
+                    - 'sts:AssumeRole'
+          Description: A role for K8s Control Plane to use when calling AWS APIs on our behalf (autoscaling, etc)
+          ManagedPolicyArns: 
+            - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+          PermissionsBoundary: arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+          RoleName: EKSRoleForCP_TESTNVME
+    RoleForEKSNodes:
+        Type: AWS::IAM::Role
+        Properties: 
+          AssumeRolePolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Principal:
+                    Service:
+                      - ec2.amazonaws.com
+                  Action:
+                    - 'sts:AssumeRole'
+          Description: A role for Kubelet to use when calling AWS APIs on our behalf (attaching ENIs, etc.)
+          ManagedPolicyArns: 
+            - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+            - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+            - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+            - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+            - arn:aws:iam::aws:policy/AmazonEKSServicePolicy
+            - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+            - arn:aws:iam::aws:policy/AmazonSSMPatchAssociation
+          RoleName: EKSRoleForNodes_TESTNVME
+    CPInstanceProfile:
+        Type: AWS::IAM::InstanceProfile
+        Properties:
+            Roles: 
+                - !Ref RoleForEKSCP
+    CPInstanceLaunchTemplate:
+        Type: AWS::EC2::LaunchTemplate
+        Properties: 
+          LaunchTemplateData: 
+            IamInstanceProfile: 
+              Name: !Ref CPInstanceProfile
+            TagSpecifications: 
+              - ResourceType: instance
+                Tags:
+                - Key: foo
+                  Value: bar
+            ImageId: ami-0a948e2e9b44980a4
+            InstanceType: m5.2xlarge
+            KeyName: !Ref KeyPair
+            SecurityGroupIds:
+                - !Ref SGForCP
+            UserData:
+                Fn::Base64: |
+                    #!/bin/bash
+                    yum update -y
+                    echo "Installing containerd 1.7"
+                    curl -Lo containerd.tar.gz https://github.com/containerd/containerd/releases/download/v1.7.0-rc.3/containerd-1.7.0-rc.3-linux-amd64.tar.gz
+                    tar Cxzvf /usr/ containerd.tar.gz
+                    systemctl daemon-reload
+                    systemctl restart --now containerd
+                    
+                    echo "installing kubeadm 1.25"
+                    cat <<EOF | tee /etc/yum.repos.d/kubernetes.repo
+                    [kubernetes]
+                    name=Kubernetes
+                    baseurl=https://packages.cloud.google.com/yum/repos/kubernetes-el7-\$basearch
+                    enabled=1
+                    gpgcheck=1
+                    gpgkey=https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+                    exclude=kubelet kubeadm kubectl
+                    EOF
+                    # Set SELinux in permissive mode (effectively disabling it)
+                    setenforce 0
+                    sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config
+                    yum install -y kubelet-1.25.6-0 --disableexcludes=kubernetes
+                    yum versionlock -y kubelet-1.25.6-0 --disableexcludes=kubernetes
+                    yum install -y kubeadm-1.25.6-0 kubectl-1.25.6-0 --disableexcludes=kubernetes
+    CPInstanceA:
+        Type: AWS::EC2::Instance
+        Properties: 
+          AvailabilityZone: us-west-2a
+          LaunchTemplate: 
+            LaunchTemplateId: !Ref CPInstanceLaunchTemplate
+            Version: !GetAtt CPInstanceLaunchTemplate.LatestVersionNumber
+          SubnetId: !Ref TestSNa
+
+    CPLB:
+        Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+        Properties: 
+          IpAddressType: ipv4
+          Name: KubernetesAPI
+          Subnets: 
+            - !Ref TestSNa
+            - !Ref TestSNb
+          Type: network
+    CPLBTargetGroup:
+        Type: AWS::ElasticLoadBalancingV2::TargetGroup
+        Properties: 
+          HealthyThresholdCount: 2
+          HealthCheckIntervalSeconds: 5
+          Name: k8s-controlplane
+          Port: 6443
+          Protocol: TCP
+          Targets: 
+            -   AvailabilityZone: all
+                Id: !Ref CPInstanceA
+                Port: 6443
+          TargetType: instance
+          VpcId: !Ref CPVPC
+    CPLBListener:
+        Type: AWS::ElasticLoadBalancingV2::Listener
+        Properties: 
+          DefaultActions: 
+            -   TargetGroupArn: !Ref CPLBTargetGroup
+                Type: forward
+          LoadBalancerArn: !Ref CPLB
+          Port: 6443
+          Protocol: tcp
+Outputs:
+  KubeAPILoadBalancerDNSName:
+    Description: The DNSName of the Kube API load balancer
+    Value: !GetAtt CPLB.DNSName
