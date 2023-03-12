@@ -61,6 +61,16 @@ Resources:
               FromPort: 22
               IpProtocol: tcp
               ToPort: 22
+            - CidrIp: 0.0.0.0/0
+              Description: KubeAPI from anywhere
+              FromPort: 6443
+              IpProtocol: tcp
+              ToPort: 6443
+            - CidrIp: 10.0.0.0/8
+              Description: incoming requests from API to nodes
+              FromPort: 10250
+              ToPort: 10250
+              IpProtocol: tcp
           VpcId: !Ref CPVPC
     RoleForEKSCP:
         Type: AWS::IAM::Role
@@ -71,13 +81,15 @@ Resources:
                 - Effect: Allow
                   Principal:
                     Service:
-                      - eks.amazonaws.com
+                      - ec2.amazonaws.com
                   Action:
                     - 'sts:AssumeRole'
           Description: A role for K8s Control Plane to use when calling AWS APIs on our behalf (autoscaling, etc)
           ManagedPolicyArns: 
             - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
-          PermissionsBoundary: arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+            - arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess
+            - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+            - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
           RoleName: EKSRoleForCP_TESTNVME
     RoleForEKSNodes:
         Type: AWS::IAM::Role
@@ -106,12 +118,15 @@ Resources:
         Properties:
             Roles: 
                 - !Ref RoleForEKSCP
-    CPInstanceLaunchTemplate:
+    ALLInstancesLaunchTemplate:
         Type: AWS::EC2::LaunchTemplate
         Properties: 
           LaunchTemplateData: 
             IamInstanceProfile: 
               Name: !Ref CPInstanceProfile
+            MetadataOptions:
+                InstanceMetadataTags: enabled
+                HttpTokens: required
             TagSpecifications: 
               - ResourceType: instance
                 Tags:
@@ -125,7 +140,6 @@ Resources:
             UserData:
                 Fn::Base64: |
                     #!/bin/bash
-                    yum update -y
                     echo "Installing containerd 1.7"
                     curl -Lo containerd.tar.gz https://github.com/containerd/containerd/releases/download/v1.7.0-rc.3/containerd-1.7.0-rc.3-linux-amd64.tar.gz
                     tar Cxzvf /usr/ containerd.tar.gz
@@ -142,41 +156,157 @@ Resources:
                     gpgkey=https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
                     exclude=kubelet kubeadm kubectl
                     EOF
+                    yum update -y
+                    yum install -y vim
                     # Set SELinux in permissive mode (effectively disabling it)
                     setenforce 0
                     sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config
                     yum install -y kubelet-1.25.6-0 --disableexcludes=kubernetes
                     yum versionlock -y kubelet-1.25.6-0 --disableexcludes=kubernetes
+                    
+                    # Installing kubelet systemd unit (default from yum repo still depends on docker instead of containerd)
+                    # note "EOF" is quoted, therefor no variable expansion here, so e.g. $KUBELET_ARGS, etc. remain variables in the file
+                    cat <<"EOF" | tee /etc/systemd/system/kubelet.service
+                    [Unit]
+                    Description=Kubernetes Kubelet
+                    Documentation=https://github.com/kubernetes/kubernetes
+                    After=iptables-restore.service
+                    [Service]
+                    ExecStartPre=/sbin/iptables -P FORWARD ACCEPT -w 5
+                    ExecStart=/usr/bin/kubelet --cloud-provider aws \
+                        --image-credential-provider-config /etc/eks/ecr-credential-provider/ecr-credential-provider-config \
+                        --image-credential-provider-bin-dir /etc/eks/ecr-credential-provider \
+                        --config /etc/kubernetes/kubelet/kubelet-config.json \
+                        --kubeconfig /var/lib/kubelet/kubeconfig \
+                        --container-runtime containerd \
+                        --network-plugin cni $KUBELET_ARGS $KUBELET_EXTRA_ARGS
+                    Restart=always
+                    RestartSec=5
+                    KillMode=process
+                    [Install]
+                    WantedBy=multi-user.target
+                    EOF
                     yum install -y kubeadm-1.25.6-0 kubectl-1.25.6-0 --disableexcludes=kubernetes
+                    kubeadm config images pull
+                    systemctl enable kubelet.service
+                    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.9.21.zip" -o "awscliv2.zip"
+                    unzip awscliv2.zip
+                    sudo ./aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli --update
+                    
+                    KUBEAPIDNS=$(aws  ssm get-parameter --name kubernetes --query "Parameter.Value" --output text)
+                    
+                    # setting up config.yaml for cluster - note EOF unquoted, so we replace the variable here
+                    cat <<EOF | tee config.yaml
+                    apiServer:
+                      timeoutForControlPlane: 4m0s
+                    apiVersion: kubeadm.k8s.io/v1beta3
+                    clusterName: kubernetes
+                    dns: {}
+                    kind: ClusterConfiguration
+                    kubernetesVersion: 1.25.6
+                    controlPlaneEndpoint: $KUBEAPIDNS
+                    ---
+                    apiVersion: kubelet.config.k8s.io/v1beta1
+                    cgroupDriver: systemd
+                    clusterDomain: cluster.local
+                    kind: KubeletConfiguration
+                    featureGates:
+                      UserNamespacesStatelessPodsSupport: true
+                    EOF
+                    echo "Kube API is $KUBEAPIDNS"
+                    echo "You should be able to run the following command to bootstrap the cluster:"
+                    echo "kubeadm init --config config.yaml"
+                    TOKEN=`curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"`
+                    ROLE=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/tags/instance/K8sRole)
+                    export KUBECONFIG=/etc/kubernetes/admin.conf
+                    alias k=kubectl
+                    if [ $ROLE == "InitialCP" ]
+                    then
+                      echo "We are the initial cp node, running kubeadm init"
+                      kubeadm init --config config.yaml
+                      curl -O https://raw.githubusercontent.com/aws/amazon-vpc-cni-k8s/master/config/master/aws-k8s-cni.yaml
+                      kubectl apply -f aws-k8s-cni.yaml
+                    elif [ $ROLE == "AdditionalCP" ]
+                    then
+                      echo "We are subsequent cp node, running kubeadm join as CP"
+                    elif [ $ROLE == "WorkerNode" ]
+                    then
+                      echo "We are worker node, running kubeadm join as worker"
+                    fi
+                    echo "Ending script for now."
     CPInstanceA:
         Type: AWS::EC2::Instance
-        Properties: 
-          AvailabilityZone: us-west-2a
+        DependsOn: 
+            - IGWtoVPC
+            - KubeAPIDNSParameter
+        Properties:
+          Tags:
+            - Key: K8sRole
+              Value: InitialCP
           LaunchTemplate: 
-            LaunchTemplateId: !Ref CPInstanceLaunchTemplate
-            Version: !GetAtt CPInstanceLaunchTemplate.LatestVersionNumber
+            LaunchTemplateId: !Ref ALLInstancesLaunchTemplate
+            Version: !GetAtt ALLInstancesLaunchTemplate.LatestVersionNumber
+          SubnetId: !Ref TestSNa
+    CPInstanceB:
+        Type: AWS::EC2::Instance
+        DependsOn: 
+            - IGWtoVPC
+            - KubeAPIDNSParameter
+        Properties:
+          Tags:
+            - Key: K8sRole
+              Value: AdditionalCP
+          LaunchTemplate: 
+            LaunchTemplateId: !Ref ALLInstancesLaunchTemplate
+            Version: !GetAtt ALLInstancesLaunchTemplate.LatestVersionNumber
+          SubnetId: !Ref TestSNa
+    WorkerInstanceA:
+        Type: AWS::EC2::Instance
+        DependsOn: 
+            - IGWtoVPC
+            - KubeAPIDNSParameter
+        Properties:
+          Tags:
+            - Key: K8sRole
+              Value: WorkerNode
+          LaunchTemplate: 
+            LaunchTemplateId: !Ref ALLInstancesLaunchTemplate
+            Version: !GetAtt ALLInstancesLaunchTemplate.LatestVersionNumber
           SubnetId: !Ref TestSNa
 
     CPLB:
         Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+        DependsOn: 
+            - IGWtoVPC
         Properties: 
           IpAddressType: ipv4
-          Name: KubernetesAPI
+          Name: kubeapi
           Subnets: 
             - !Ref TestSNa
             - !Ref TestSNb
           Type: network
+    KubeAPIDNSParameter:
+        Type: AWS::SSM::Parameter
+        DependsOn: 
+            - CPLB
+        Properties: 
+          DataType: text
+          Description: "DNS Name for the KubeAPI Load Balancer"
+          Name: kubernetes
+          Type: String
+          Value: !GetAtt CPLB.DNSName
+        
     CPLBTargetGroup:
         Type: AWS::ElasticLoadBalancingV2::TargetGroup
         Properties: 
           HealthyThresholdCount: 2
           HealthCheckIntervalSeconds: 5
+          HealthCheckTimeoutSeconds: 3
           Name: k8s-controlplane
           Port: 6443
           Protocol: TCP
           Targets: 
-            -   AvailabilityZone: all
-                Id: !Ref CPInstanceA
+            -   Id: !Ref CPInstanceA
                 Port: 6443
           TargetType: instance
           VpcId: !Ref CPVPC
@@ -188,7 +318,7 @@ Resources:
                 Type: forward
           LoadBalancerArn: !Ref CPLB
           Port: 6443
-          Protocol: tcp
+          Protocol: TCP
 Outputs:
   KubeAPILoadBalancerDNSName:
     Description: The DNSName of the Kube API load balancer
