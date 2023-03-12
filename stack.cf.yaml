@@ -247,19 +247,6 @@ Resources:
             LaunchTemplateId: !Ref ALLInstancesLaunchTemplate
             Version: !GetAtt ALLInstancesLaunchTemplate.LatestVersionNumber
           SubnetId: !Ref TestSNa
-    CPInstanceB:
-        Type: AWS::EC2::Instance
-        DependsOn: 
-            - IGWtoVPC
-            - KubeAPIDNSParameter
-        Properties:
-          Tags:
-            - Key: K8sRole
-              Value: AdditionalCP
-          LaunchTemplate: 
-            LaunchTemplateId: !Ref ALLInstancesLaunchTemplate
-            Version: !GetAtt ALLInstancesLaunchTemplate.LatestVersionNumber
-          SubnetId: !Ref TestSNa
     WorkerInstanceA:
         Type: AWS::EC2::Instance
         DependsOn: 
