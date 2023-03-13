@@ -6,7 +6,7 @@ plane manually in EC2, using the "stock" EKS AMI (currently for 1.25) but adding
 containerd from the 1.7 release candidate.
 
 This is the command I use to deploy the stack:
-```
+```bash
 KEYPAIR_NAME=some_keypair_name
 aws cloudformation create-stack --stack-name testns --template-body file://stack.cf.yaml --parameters ParameterKey=KeyPair,ParameterValue=$KEYPAIR_NAME --capabilities CAPABILITY_NAMED_IAM --disable-rollback
 ```
@@ -24,5 +24,8 @@ Current results: No - need to dig further.
 1. simplify reading of results (confirming if user namespace is being used)
 
 
+Notes for confirming
+```bash
 pstree -N user
 journalctl --since "2013-03-13 18:42:11" --until "2013-03-13 18:42:22"
+```
