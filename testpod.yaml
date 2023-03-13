@@ -21,3 +21,26 @@ spec:
     containers:
     - image: nginx
       name: nginx
+---
+apiVersion: "v1"
+kind: "Pod"
+metadata:
+  name: "sandbox"
+  labels:
+    name: "sandbox"
+spec:
+  hostUsers: false
+  containers:
+    -
+      name: "sandbox"
+      image: gcr.io/google_containers/busybox
+      command:
+        - "/bin/sh"
+        - "-c"
+        - "while true; do date; echo `date`; sleep 5; done"
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+    runAsUser: 4000
+    runAsGroup: 4000

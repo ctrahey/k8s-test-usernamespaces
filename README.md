@@ -22,3 +22,7 @@ Current results: No - need to dig further.
 1. Joining worker node to cluster
 1. deploying the test workload
 1. simplify reading of results (confirming if user namespace is being used)
+
+
+pstree -N user
+journalctl --since "2013-03-13 18:42:11" --until "2013-03-13 18:42:22"

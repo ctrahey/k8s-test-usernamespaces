@@ -90,7 +90,24 @@ Resources:
             - arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess
             - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
             - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+            - arn:aws:iam::aws:policy/AmazonSSMPatchAssociation
+            - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
           RoleName: EKSRoleForCP_TESTNVME
+          Policies:
+            - PolicyName: allow_put_k8s_params
+              PolicyDocument:
+                 Version: 2012-10-17
+                 Statement:
+                    - Sid: PUTKubeParams
+                      Effect: Allow
+                      Action:
+                        - 'ssm:PutParameter'
+                        - 'ssm:LabelParameterVersion'
+                        - 'ssm:DeleteParameter'
+                        - 'ssm:UnlabelParameterVersion'
+                      Resource:
+                        - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/kube-join-command'
+                        - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/kube-config'
     RoleForEKSNodes:
         Type: AWS::IAM::Role
         Properties: 
@@ -193,7 +210,7 @@ Resources:
                     unzip awscliv2.zip
                     sudo ./aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli --update
                     
-                    KUBEAPIDNS=$(aws  ssm get-parameter --name kubernetes --query "Parameter.Value" --output text)
+                    KUBEAPIDNS=$(aws ssm get-parameter --name kubernetes --query "Parameter.Value" --output text)
                     
                     # setting up config.yaml for cluster - note EOF unquoted, so we replace the variable here
                     cat <<EOF | tee config.yaml
@@ -205,6 +222,8 @@ Resources:
                     kind: ClusterConfiguration
                     kubernetesVersion: 1.25.6
                     controlPlaneEndpoint: $KUBEAPIDNS
+                    featureGates:
+                      UserNamespacesStatelessPodsSupport: true
                     ---
                     apiVersion: kubelet.config.k8s.io/v1beta1
                     cgroupDriver: systemd
@@ -226,12 +245,23 @@ Resources:
                       kubeadm init --config config.yaml
                       curl -O https://raw.githubusercontent.com/aws/amazon-vpc-cni-k8s/master/config/master/aws-k8s-cni.yaml
                       kubectl apply -f aws-k8s-cni.yaml
+                      JOIN=$(kubeadm token create --print-join-command)
+                      aws ssm put-parameter --name kube-join-command --type SecureString --value "$JOIN" --overwrite
+                      aws ssm put-parameter --name kube-config --tier Intelligent-Tiering --type SecureString --value "$(cat /etc/kubernetes/admin.conf)" --overwrite
                     elif [ $ROLE == "AdditionalCP" ]
                     then
                       echo "We are subsequent cp node, running kubeadm join as CP"
                     elif [ $ROLE == "WorkerNode" ]
                     then
-                      echo "We are worker node, running kubeadm join as worker"
+                      cat <<"EOF"
+                      We are worker node, run the following to join as worker
+                      JOIN=$(aws ssm get-parameter --name kube-join-command --with-decryption --query Parameter.Value --output text)
+                      $JOIN
+                      NOTE: The following is only necessary if you want to talk to the cluster from this node. Not recommended to have this lying around, but useful for debugging.
+                      export KUBECONFIG=/etc/kubernetes/admin.conf
+                      aws ssm get-parameter --name kube-config --with-decryption --query Parameter.Value --output text > /etc/kubernetes/admin.conf
+                      kubectl get nodes
+                      EOF
                     fi
                     echo "Ending script for now."
     CPInstanceA:
