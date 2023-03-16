@@ -158,7 +158,7 @@ Resources:
                 Fn::Base64: |
                     #!/bin/bash
                     echo "Installing containerd 1.7"
-                    curl -Lo containerd.tar.gz https://github.com/containerd/containerd/releases/download/v1.7.0-rc.3/containerd-1.7.0-rc.3-linux-amd64.tar.gz
+                    curl -Lo containerd.tar.gz https://github.com/containerd/containerd/releases/download/v1.7.0/containerd-1.7.0-linux-amd64.tar.gz
                     tar Cxzvf /usr/ containerd.tar.gz
                     systemctl daemon-reload
                     systemctl restart --now containerd
