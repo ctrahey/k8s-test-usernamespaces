@@ -179,7 +179,7 @@ Resources:
                     setenforce 0
                     sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config
                     yum install -y kubelet-1.25.6-0 --disableexcludes=kubernetes
-                    yum versionlock -y kubelet-1.25.6-0 --disableexcludes=kubernetes
+                    yum versionlock -y kubelet-1.25.7-0 --disableexcludes=kubernetes
                     
                     # Installing kubelet systemd unit (default from yum repo still depends on docker instead of containerd)
                     # note "EOF" is quoted, therefor no variable expansion here, so e.g. $KUBELET_ARGS, etc. remain variables in the file
@@ -203,7 +203,7 @@ Resources:
                     [Install]
                     WantedBy=multi-user.target
                     EOF
-                    yum install -y kubeadm-1.25.6-0 kubectl-1.25.6-0 --disableexcludes=kubernetes
+                    yum install -y kubeadm-1.25.7-0 kubectl-1.25.7-0 --disableexcludes=kubernetes
                     kubeadm config images pull
                     systemctl enable kubelet.service
                     curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.9.21.zip" -o "awscliv2.zip"
@@ -222,8 +222,9 @@ Resources:
                     kind: ClusterConfiguration
                     kubernetesVersion: 1.25.6
                     controlPlaneEndpoint: $KUBEAPIDNS
-                    featureGates:
-                      UserNamespacesStatelessPodsSupport: true
+                    apiServer:
+                      extraArgs:
+                        feature-gates: "UserNamespacesStatelessPodsSupport=True"
                     ---
                     apiVersion: kubelet.config.k8s.io/v1beta1
                     cgroupDriver: systemd
@@ -233,8 +234,6 @@ Resources:
                       UserNamespacesStatelessPodsSupport: true
                     EOF
                     echo "Kube API is $KUBEAPIDNS"
-                    echo "You should be able to run the following command to bootstrap the cluster:"
-                    echo "kubeadm init --config config.yaml"
                     TOKEN=`curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"`
                     ROLE=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/tags/instance/K8sRole)
                     export KUBECONFIG=/etc/kubernetes/admin.conf
@@ -261,7 +260,7 @@ Resources:
                       export KUBECONFIG=/etc/kubernetes/admin.conf
                       aws ssm get-parameter --name kube-config --with-decryption --query Parameter.Value --output text > /etc/kubernetes/admin.conf
                       kubectl get nodes
-                      EOF
+                    EOF
                     fi
                     echo "Ending script for now."
     CPInstanceA:
@@ -289,8 +288,7 @@ Resources:
           LaunchTemplate: 
             LaunchTemplateId: !Ref ALLInstancesLaunchTemplate
             Version: !GetAtt ALLInstancesLaunchTemplate.LatestVersionNumber
-          SubnetId: !Ref TestSNa
-
+          SubnetId: !Ref TestSNa        
     CPLB:
         Type: AWS::ElasticLoadBalancingV2::LoadBalancer
         DependsOn: 
@@ -312,7 +310,6 @@ Resources:
           Name: kubernetes
           Type: String
           Value: !GetAtt CPLB.DNSName
-        
     CPLBTargetGroup:
         Type: AWS::ElasticLoadBalancingV2::TargetGroup
         Properties: 
