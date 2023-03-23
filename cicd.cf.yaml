@@ -1,0 +1,160 @@
+Parameters:
+    FoundationStackName:
+        Type: String
+        Description: Name of the stack from which to import foundational resources (VPC, Subnets, etc)
+Resources:
+    BoundaryForCICDResources:
+      Type: AWS::IAM::ManagedPolicy
+      Properties: 
+        Description: Limit the scope of RoleForCodePipeline to just our resources
+        ManagedPolicyName: LimitCICDToResources
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            Action:
+              - s3:*
+              - codecommit:*
+              - codebuild:*
+              - logs:*
+            Effect: Allow
+            Resource:
+              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*
+              - !GetAtt CODE.Arn
+              - !Sub arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:* # Using !Sub here (instead of GetAttr on the ARN) to avoid circular dependency, since the codebuild refers to this role
+              - Fn::ImportValue: !Sub "${FoundationStackName}-SourceAndArtifactBucketArn"
+              - !Sub
+                - "arn:aws:s3:::${BucketName}/*"
+                - BucketName: 
+                    'Fn::ImportValue': !Sub "${FoundationStackName}-SourceAndArtifactBucket"
+    RoleForCICD:
+        Type: AWS::IAM::Role
+        Properties: 
+          AssumeRolePolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Principal:
+                    Service:
+                      - codepipeline.amazonaws.com
+                      - codebuild.amazonaws.com
+                  Action:
+                    - 'sts:AssumeRole'
+          Description: A role for CodePipeline & CodeBuild
+          ManagedPolicyArns: 
+            - arn:aws:iam::aws:policy/AWSCodePipeline_FullAccess
+            - arn:aws:iam::aws:policy/AWSCodeCommitFullAccess
+            - arn:aws:iam::aws:policy/AmazonS3FullAccess
+            - arn:aws:iam::aws:policy/AWSCodeBuildDeveloperAccess
+            - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+          RoleName: CodePipelineFull
+          PermissionsBoundary: !Ref BoundaryForCICDResources
+          
+    RoleForCodeBuild:
+        Type: AWS::IAM::Role
+        Properties: 
+          AssumeRolePolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Principal:
+                    Service:
+                      - codebuild.amazonaws.com
+                  Action:
+                    - 'sts:AssumeRole'
+          Description: A role for CodeBuild
+          Policies:
+            - PolicyName: CodeBuildAccessLogsEtc
+              PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Effect: Allow
+                  Resource:
+                    - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*
+          RoleName: CodeBuldServiceRole
+          PermissionsBoundary: !Ref BoundaryForCICDResources
+    CODE:
+      Type: AWS::CodeCommit::Repository
+      Properties: 
+        Code: 
+          BranchName: main
+          S3: ./app
+        RepositoryDescription: "Source code for example app"
+        RepositoryName: SampleSource
+    ECR:
+      Type: AWS::ECR::Repository
+      Properties: 
+        RepositoryPolicyText:
+          Version: "2008-10-17"
+          Statement:
+            - Sid: "Push only from this account"
+              Effect: Allow
+              Principal:
+                AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+              Action:
+                - "ecr-public:BatchCheckLayerAvailability"
+                - "ecr-public:PutImage"
+                - "ecr-public:InitiateLayerUpload"
+                - "ecr-public:UploadLayerPart"
+                - "ecr-public:CompleteLayerUpload"
+    Build:
+      Type: AWS::CodeBuild::Project
+      Properties: 
+        Artifacts: 
+          Type: CODEPIPELINE
+        Environment: 
+          ComputeType: BUILD_GENERAL1_SMALL
+          EnvironmentVariables: 
+            - Name: FOO
+              Value: BAR
+              Type: PLAINTEXT
+          Image: "aws/codebuild/standard:6.0"
+          PrivilegedMode: false
+          Type: LINUX_CONTAINER
+        Name: !Sub ${AWS::StackName}-build
+        ServiceRole: !GetAtt RoleForCICD.Arn
+        Source: 
+          Type: CODEPIPELINE
+    Pipeline:
+      Type: AWS::CodePipeline::Pipeline
+      Properties:
+        Name: ThisProjectPipeline
+        ArtifactStore: 
+          Type: S3
+          Location:
+            Fn::ImportValue: !Sub "${FoundationStackName}-SourceAndArtifactBucket"
+        RoleArn: !GetAtt RoleForCICD.Arn
+        Stages:
+          - Name: Source
+            Actions:
+              - Name: PullSource
+                ActionTypeId:
+                  Category: Source
+                  Owner: AWS
+                  Provider: CodeCommit
+                  Version: 1
+                RunOrder: 1
+                Configuration:
+                  RepositoryName: !GetAtt CODE.Name
+                  BranchName: main
+                  PollForSourceChanges: false
+                OutputArtifacts:
+                  - Name: SourceCode
+          - Name: Build
+            Actions:
+              - Name: RunCodeBuild
+                ActionTypeId:
+                  Category: Build
+                  Owner: AWS
+                  Provider: CodeBuild
+                  Version: 1
+                RunOrder: 1
+                InputArtifacts:
+                  - Name: SourceCode
+                Configuration:
+                  ProjectName: !Ref Build
+                  
+                  

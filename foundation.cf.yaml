@@ -1,0 +1,209 @@
+Parameters:
+    Foo:
+        Type: CommaDelimitedList
+        Description: Availability Zones to use. Pease ensure all AZs are in the same region (this is not validated)
+        Default: "us-west-2a,us-west-2b"
+Resources:
+    CPVPC:
+        Type: AWS::EC2::VPC
+        Properties: 
+          CidrBlock: 10.0.0.0/16
+          EnableDnsHostnames: True
+    IGW:
+        Type: AWS::EC2::InternetGateway
+        Properties: {}
+    IGWtoVPC:
+        Type: AWS::EC2::VPCGatewayAttachment
+        Properties:
+          VpcId: !Ref CPVPC
+          InternetGatewayId: !Ref IGW
+    RT:
+        Type: AWS::EC2::RouteTable
+        Properties: 
+          VpcId: !Ref CPVPC
+    RouteIGW:
+        Type: AWS::EC2::Route
+        Properties: 
+          DestinationCidrBlock: 0.0.0.0/0
+          GatewayId: !Ref IGW
+          RouteTableId: !Ref RT
+    TestSNa:
+        Type: AWS::EC2::Subnet
+        Properties: 
+          CidrBlock: 10.0.1.0/24
+          MapPublicIpOnLaunch: true
+          AvailabilityZone: !Select [0, !GetAZs ""]
+          VpcId: !Ref CPVPC
+    TestSNb:
+        Type: AWS::EC2::Subnet
+        Properties: 
+          CidrBlock: 10.0.2.0/24
+          MapPublicIpOnLaunch: true
+          AvailabilityZone: !Select [1, !GetAZs ""]
+          VpcId: !Ref CPVPC
+    RTAssnSNa:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties: 
+          RouteTableId: !Ref RT
+          SubnetId: !Ref TestSNa
+    RTAssnNSb:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties: 
+          RouteTableId: !Ref RT
+          SubnetId: !Ref TestSNb
+    SGForCP:
+        Type: AWS::EC2::SecurityGroup
+        Properties: 
+          GroupDescription: "Allow SSH"
+          GroupName: ssh-for-cp
+          SecurityGroupIngress:
+            - CidrIp: 0.0.0.0/0
+              Description: SSH from anywhere
+              FromPort: 22
+              IpProtocol: tcp
+              ToPort: 22
+            - CidrIp: 0.0.0.0/0
+              Description: KubeAPI from anywhere
+              FromPort: 6443
+              IpProtocol: tcp
+              ToPort: 6443
+            - CidrIp: 10.0.0.0/8
+              Description: incoming requests from API to nodes
+              FromPort: 10250
+              ToPort: 10250
+              IpProtocol: tcp
+          VpcId: !Ref CPVPC
+    RoleForEKSCP:
+        Type: AWS::IAM::Role
+        Properties: 
+          AssumeRolePolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Principal:
+                    Service:
+                      - ec2.amazonaws.com
+                  Action:
+                    - 'sts:AssumeRole'
+          Description: A role for K8s Control Plane to use when calling AWS APIs on our behalf (autoscaling, etc)
+          ManagedPolicyArns: 
+            - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+            - arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess
+            - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+            - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+            - arn:aws:iam::aws:policy/AmazonSSMPatchAssociation
+            - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+          RoleName: EKSRoleForCP_TESTNVME
+          Policies:
+            - PolicyName: allow_put_k8s_params
+              PolicyDocument:
+                 Version: 2012-10-17
+                 Statement:
+                    - Sid: PUTKubeParams
+                      Effect: Allow
+                      Action:
+                        - 'ssm:PutParameter'
+                        - 'ssm:LabelParameterVersion'
+                        - 'ssm:DeleteParameter'
+                        - 'ssm:UnlabelParameterVersion'
+                      Resource:
+                        - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/kube-join-command'
+                        - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/kube-config'
+    RoleForEKSNodes:
+        Type: AWS::IAM::Role
+        Properties: 
+          AssumeRolePolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Principal:
+                    Service:
+                      - ec2.amazonaws.com
+                  Action:
+                    - 'sts:AssumeRole'
+          Description: A role for Kubelet to use when calling AWS APIs on our behalf (attaching ENIs, etc.)
+          ManagedPolicyArns: 
+            - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+            - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+            - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+            - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+            - arn:aws:iam::aws:policy/AmazonEKSServicePolicy
+            - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+            - arn:aws:iam::aws:policy/AmazonSSMPatchAssociation
+          RoleName: EKSRoleForNodes_TESTNVME
+    CPInstanceProfile:
+        Type: AWS::IAM::InstanceProfile
+        Properties:
+            Roles: 
+                - !Ref RoleForEKSCP
+    CPLB:
+        Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+        DependsOn: 
+            - IGWtoVPC
+        Properties: 
+          IpAddressType: ipv4
+          Name: kubeapi
+          Subnets: 
+            - !Ref TestSNa
+            - !Ref TestSNb
+          Type: network
+    KubeAPIDNSParameter:
+        Type: AWS::SSM::Parameter
+        DependsOn: 
+            - CPLB
+        Properties: 
+          DataType: text
+          Description: "DNS Name for the KubeAPI Load Balancer"
+          Name: kubernetes
+          Type: String
+          Value: !GetAtt CPLB.DNSName
+    SourceAndArtifactBucket:
+      Type: AWS::S3::Bucket
+      Properties: {}
+Outputs:
+  BucketName:
+    Description: S3 Bucket name for artifacts and source
+    Value: !Ref SourceAndArtifactBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-SourceAndArtifactBucket"
+  BucketArn:
+    Description: S3 Bucket Arn for artifacts and source
+    Value: !GetAtt SourceAndArtifactBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-SourceAndArtifactBucketArn"
+  KubeAPILoadBalancerDNSName:
+    Description: The DNSName of the Kube API load balancer
+    Value: !GetAtt CPLB.DNSName
+    Export:
+      Name: !Sub "${AWS::StackName}-KubeAPILoadBalancerDNSName"
+  KubeAPILoadBalancerARN:
+    Description: The ARN of the Kube API load balancer
+    Value: !Ref CPLB
+    Export:
+      Name: !Sub "${AWS::StackName}-KubeAPILoadBalancerARN"
+  CPInstanceProfile:
+    Description: Instance Profile for Control-Plane instances
+    Value: !Ref CPInstanceProfile
+    Export:
+      Name: !Sub "${AWS::StackName}-CPInstanceProfile"
+  SGForCP:
+    Description: Security Group for Control-Plane instances
+    Value: !Ref SGForCP
+    Export:
+      Name: !Sub "${AWS::StackName}-SGForCP"
+  SubnetA:
+    Description: First Cluster Subnet
+    Value: !Ref TestSNa
+    Export:
+      Name: !Sub "${AWS::StackName}-SubnetA"
+  SubnetB:
+    Description: Second Cluster Subnet
+    Value: !Ref TestSNb
+    Export:
+      Name: !Sub "${AWS::StackName}-SubnetB"
+  VPC:
+    Description: Cluster VPC
+    Value: !Ref CPVPC
+    Export:
+      Name: !Sub "${AWS::StackName}-VPC"
+  
